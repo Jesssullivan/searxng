@@ -3,13 +3,12 @@
 #   - Configurable rate limit constants (limiter.toml)
 #   - Valkey reconnection logic (sidecar restart resilience)
 #   - Graceful degradation when Valkey is unavailable
+#   - PostgreSQL result cache plugin (psycopg3 + pool)
 #
 # Build:
 #   docker build -f container/Dockerfile.k8s \
 #     --build-arg BASE_TAG=2026.3.13-3c1f68c59 \
 #     -t ghcr.io/jesssullivan/searxng:k8s-2026.3.13 .
-#
-# The patches overlay 4 files. All other SearXNG code is unmodified.
 
 ARG BASE_TAG=latest
 FROM docker.io/searxng/searxng:${BASE_TAG}
@@ -23,9 +22,18 @@ COPY searx/valkeydb.py /usr/local/searxng/searx/valkeydb.py
 # Patch 3: Graceful degradation in botdetection Valkey client
 COPY searx/botdetection/valkeydb.py /usr/local/searxng/searx/botdetection/valkeydb.py
 
-# Pre-compile patched files
+# Patch 4: PostgreSQL result cache plugin
+COPY searx/plugins/pg_cache.py /usr/local/searxng/searx/plugins/pg_cache.py
+
+# Install psycopg3 + connection pool for PG cache plugin
+RUN /usr/local/searxng/.venv/bin/pip install --no-cache-dir \
+    "psycopg[binary]>=3.1" \
+    "psycopg_pool>=3.1"
+
+# Pre-compile all patched files
 RUN /usr/local/searxng/.venv/bin/python -m compileall \
     /usr/local/searxng/searx/botdetection/ip_limit.py \
     /usr/local/searxng/searx/valkeydb.py \
     /usr/local/searxng/searx/botdetection/valkeydb.py \
+    /usr/local/searxng/searx/plugins/pg_cache.py \
     2>/dev/null || true
