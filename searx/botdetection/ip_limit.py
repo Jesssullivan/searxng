@@ -4,36 +4,23 @@
 Method ``ip_limit``
 -------------------
 
-The ``ip_limit`` method counts request from an IP in *sliding windows*.  If
-there are to many requests in a sliding window, the request is evaluated as a
-bot request.  This method requires a valkey DB and needs a HTTP X-Forwarded-For_
-header.  To take privacy only the hash value of an IP is stored in the valkey DB
-and at least for a maximum of 10 minutes.
+Kubernetes-hardened fork: rate limit constants are configurable via limiter.toml.
 
-The :py:obj:`.link_token` method can be used to investigate whether a request is
-*suspicious*.  To activate the :py:obj:`.link_token` method in the
-:py:obj:`.ip_limit` method add the following configuration:
+Add to limiter.toml to override defaults:
 
 .. code:: toml
 
    [botdetection.ip_limit]
-   link_token = true
-
-If the :py:obj:`.link_token` method is activated and a request is *suspicious*
-the request rates are reduced:
-
-- :py:obj:`BURST_MAX` -> :py:obj:`BURST_MAX_SUSPICIOUS`
-- :py:obj:`LONG_MAX` -> :py:obj:`LONG_MAX_SUSPICIOUS`
-
-To intercept bots that get their IPs from a range of IPs, there is a
-:py:obj:`SUSPICIOUS_IP_WINDOW`.  In this window the suspicious IPs are stored
-for a longer time.  IPs stored in this sliding window have a maximum of
-:py:obj:`SUSPICIOUS_IP_MAX` accesses before they are blocked.  As soon as the IP
-makes a request that is not suspicious, the sliding window for this IP is
-dropped.
-
-.. _X-Forwarded-For:
-   https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/X-Forwarded-For
+   burst_window = 20
+   burst_max = 15
+   burst_max_suspicious = 2
+   long_window = 600
+   long_max = 150
+   long_max_suspicious = 10
+   api_window = 3600
+   api_max = 4
+   suspicious_ip_window = 2592000
+   suspicious_ip_max = 3
 
 """
 
@@ -58,35 +45,28 @@ from ._helpers import (
 
 logger = logger.getChild('ip_limit')
 
+# Defaults — overridable via limiter.toml [botdetection.ip_limit]
 BURST_WINDOW = 20
-"""Time (sec) before sliding window for *burst* requests expires."""
-
 BURST_MAX = 15
-"""Maximum requests from one IP in the :py:obj:`BURST_WINDOW`"""
-
 BURST_MAX_SUSPICIOUS = 2
-"""Maximum of suspicious requests from one IP in the :py:obj:`BURST_WINDOW`"""
-
 LONG_WINDOW = 600
-"""Time (sec) before the longer sliding window expires."""
-
 LONG_MAX = 150
-"""Maximum requests from one IP in the :py:obj:`LONG_WINDOW`"""
-
 LONG_MAX_SUSPICIOUS = 10
-"""Maximum suspicious requests from one IP in the :py:obj:`LONG_WINDOW`"""
-
 API_WINDOW = 3600
-"""Time (sec) before sliding window for API requests (format != html) expires."""
-
 API_MAX = 4
-"""Maximum requests from one IP in the :py:obj:`API_WINDOW`"""
-
 SUSPICIOUS_IP_WINDOW = 3600 * 24 * 30
-"""Time (sec) before sliding window for one suspicious IP expires."""
-
 SUSPICIOUS_IP_MAX = 3
-"""Maximum requests from one suspicious IP in the :py:obj:`SUSPICIOUS_IP_WINDOW`."""
+
+
+def _get_limit(cfg: config.Config, key: str, default: int) -> int:
+    """Read a rate limit value from config, falling back to module default."""
+    try:
+        val = cfg.get(f'botdetection.ip_limit.{key}')
+        if val is not None:
+            return int(val)
+    except (KeyError, TypeError, ValueError):
+        pass
+    return default
 
 
 def filter_request(
@@ -102,9 +82,21 @@ def filter_request(
         logger.debug("network %s is link-local -> not monitored by ip_limit method", network.compressed)
         return None
 
+    # Read configurable limits
+    burst_window = _get_limit(cfg, 'burst_window', BURST_WINDOW)
+    burst_max = _get_limit(cfg, 'burst_max', BURST_MAX)
+    burst_max_suspicious = _get_limit(cfg, 'burst_max_suspicious', BURST_MAX_SUSPICIOUS)
+    long_window = _get_limit(cfg, 'long_window', LONG_WINDOW)
+    long_max = _get_limit(cfg, 'long_max', LONG_MAX)
+    long_max_suspicious = _get_limit(cfg, 'long_max_suspicious', LONG_MAX_SUSPICIOUS)
+    api_window = _get_limit(cfg, 'api_window', API_WINDOW)
+    api_max = _get_limit(cfg, 'api_max', API_MAX)
+    suspicious_ip_window = _get_limit(cfg, 'suspicious_ip_window', SUSPICIOUS_IP_WINDOW)
+    suspicious_ip_max = _get_limit(cfg, 'suspicious_ip_max', SUSPICIOUS_IP_MAX)
+
     if request.args.get('format', 'html') != 'html':
-        c = incr_sliding_window(valkey_client, 'ip_limit.API_WINDOW:' + network.compressed, API_WINDOW)
-        if c > API_MAX:
+        c = incr_sliding_window(valkey_client, 'ip_limit.API_WINDOW:' + network.compressed, api_window)
+        if c > api_max:
             return too_many_requests(network, "too many request in API_WINDOW")
 
     if cfg['botdetection.ip_limit.link_token']:
@@ -118,31 +110,31 @@ def filter_request(
 
         # this IP is suspicious: count requests from this IP
         c = incr_sliding_window(
-            valkey_client, 'ip_limit.SUSPICIOUS_IP_WINDOW' + network.compressed, SUSPICIOUS_IP_WINDOW
+            valkey_client, 'ip_limit.SUSPICIOUS_IP_WINDOW' + network.compressed, suspicious_ip_window
         )
-        if c > SUSPICIOUS_IP_MAX:
+        if c > suspicious_ip_max:
             logger.error("BLOCK: too many request from %s in SUSPICIOUS_IP_WINDOW (redirect to /)", network)
             response = flask.redirect(flask.url_for('index'), code=302)
             response.headers["Cache-Control"] = "no-store, max-age=0"
             return response
 
-        c = incr_sliding_window(valkey_client, 'ip_limit.BURST_WINDOW' + network.compressed, BURST_WINDOW)
-        if c > BURST_MAX_SUSPICIOUS:
+        c = incr_sliding_window(valkey_client, 'ip_limit.BURST_WINDOW' + network.compressed, burst_window)
+        if c > burst_max_suspicious:
             return too_many_requests(network, "too many request in BURST_WINDOW (BURST_MAX_SUSPICIOUS)")
 
-        c = incr_sliding_window(valkey_client, 'ip_limit.LONG_WINDOW' + network.compressed, LONG_WINDOW)
-        if c > LONG_MAX_SUSPICIOUS:
+        c = incr_sliding_window(valkey_client, 'ip_limit.LONG_WINDOW' + network.compressed, long_window)
+        if c > long_max_suspicious:
             return too_many_requests(network, "too many request in LONG_WINDOW (LONG_MAX_SUSPICIOUS)")
 
         return None
 
-    # vanilla limiter without extensions counts BURST_MAX and LONG_MAX
-    c = incr_sliding_window(valkey_client, 'ip_limit.BURST_WINDOW' + network.compressed, BURST_WINDOW)
-    if c > BURST_MAX:
+    # vanilla limiter without extensions counts burst_max and long_max
+    c = incr_sliding_window(valkey_client, 'ip_limit.BURST_WINDOW' + network.compressed, burst_window)
+    if c > burst_max:
         return too_many_requests(network, "too many request in BURST_WINDOW (BURST_MAX)")
 
-    c = incr_sliding_window(valkey_client, 'ip_limit.LONG_WINDOW' + network.compressed, LONG_WINDOW)
-    if c > LONG_MAX:
+    c = incr_sliding_window(valkey_client, 'ip_limit.LONG_WINDOW' + network.compressed, long_window)
+    if c > long_max:
         return too_many_requests(network, "too many request in LONG_WINDOW (LONG_MAX)")
 
     return None
