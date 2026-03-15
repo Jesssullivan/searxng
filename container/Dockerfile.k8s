@@ -26,9 +26,15 @@ COPY searx/botdetection/valkeydb.py /usr/local/searxng/searx/botdetection/valkey
 COPY searx/plugins/pg_cache.py /usr/local/searxng/searx/plugins/pg_cache.py
 
 # Install psycopg3 + connection pool for PG cache plugin
-RUN /usr/local/searxng/.venv/bin/pip install --no-cache-dir \
+# SearXNG uses uv (Rust package manager), not pip
+RUN /usr/local/searxng/.venv/bin/python -m ensurepip 2>/dev/null || true && \
+    /usr/local/searxng/.venv/bin/python -m pip install --no-cache-dir \
     "psycopg[binary]>=3.1" \
-    "psycopg_pool>=3.1"
+    "psycopg_pool>=3.1" 2>/dev/null || \
+    (wget -qO- https://astral.sh/uv/install.sh | sh 2>/dev/null && \
+     ~/.local/bin/uv pip install --python /usr/local/searxng/.venv/bin/python \
+    "psycopg[binary]>=3.1" \
+    "psycopg_pool>=3.1")
 
 # Pre-compile all patched files
 RUN /usr/local/searxng/.venv/bin/python -m compileall \
