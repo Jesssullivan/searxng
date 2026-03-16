@@ -2,7 +2,13 @@
 {% from 'simple/icons.html' import icon_big %}
 {% block content %}
 <div class="index">
-    <div class="title"><h1>SearXNG</h1></div>
+    <div class="title"><h1>{{ instance_name }}</h1></div>
     {% include 'simple/simple_search.html' %}
+    <p class="search-hint">Paste an image URL to reverse search with TinEye</p>
+    <div class="category-pills">
+        {% for category in ['general', 'images', 'videos', 'music', 'news', 'science', 'it', 'files'] %}
+        <a href="/search?q=&categories={{ category }}" class="category-pill">{{ category|capitalize }}</a>
+        {% endfor %}
+    </div>
 </div>
 {% endblock %}
