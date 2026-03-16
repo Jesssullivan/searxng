@@ -28,6 +28,21 @@ if typing.TYPE_CHECKING:
 
 log = logging.getLogger("searx.plugins.pg_cache")
 
+# Category-based cache TTLs (seconds)
+# Stable content cached longer, time-sensitive content shorter
+CATEGORY_TTLS = {
+    "science": 86400,      # 24 hours — academic papers rarely change
+    "images": 43200,       # 12 hours — image results are stable
+    "videos": 21600,       # 6 hours
+    "music": 21600,        # 6 hours — music catalog is stable
+    "files": 10800,        # 3 hours — torrent/file results moderately stable
+    "it": 600,             # 10 minutes — package registries update frequently
+    "map": 3600,           # 1 hour — map data is stable
+    "general": 300,        # 5 minutes — default
+    "news": 300,           # 5 minutes — news is time-sensitive
+}
+DEFAULT_TTL = 300
+
 # Connection pool (lazy-initialized)
 _POOL = None
 _PG_URL = None
@@ -245,6 +260,14 @@ class SXNGPlugin(Plugin):
                     for result in results:
                         search.result_container.add_result(result)
                     log.debug("PG cache EXACT HIT: %s (%d results)", query[:50], result_count)
+                    # Increment hit_count for LFU-aware eviction (column may not exist yet)
+                    try:
+                        conn.execute(
+                            "UPDATE searxng_cache SET hit_count = COALESCE(hit_count, 0) + 1 WHERE query_hash = %s",
+                            (key,),
+                        )
+                    except Exception:
+                        pass
                     search._pg_cache_hit = True
                     return False
 
@@ -274,6 +297,14 @@ class SXNGPlugin(Plugin):
                             "PG cache SEMANTIC HIT: '%s' ~ '%s' (distance=%.4f, %d results)",
                             query[:30], cached_query[:30], distance, result_count
                         )
+                        # Increment hit_count for LFU-aware eviction (column may not exist yet)
+                        try:
+                            conn.execute(
+                                "UPDATE searxng_cache SET hit_count = COALESCE(hit_count, 0) + 1 WHERE query_hash = %s",
+                                (key,),
+                            )
+                        except Exception:
+                            pass
                         search._pg_cache_hit = True
                         return False
 
@@ -299,6 +330,10 @@ class SXNGPlugin(Plugin):
         safesearch = search.search_query.safesearch
 
         key = _cache_key(query, categories, language, pageno, safesearch)
+
+        # Determine TTL based on primary category (highest TTL wins for multi-category queries)
+        categories_list = categories.split(",")
+        ttl = max(CATEGORY_TTLS.get(cat.strip(), DEFAULT_TTL) for cat in categories_list) if categories_list else DEFAULT_TTL
 
         try:
             ordered = search.result_container.get_ordered_results()
@@ -331,15 +366,15 @@ class SXNGPlugin(Plugin):
                            (query_hash, query, categories, language, pageno,
                             result_count, results_json, query_embedding, expires_at)
                            VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s::vector,
-                                   NOW() + INTERVAL '%s seconds')
+                                   NOW() + make_interval(secs => %s))
                            ON CONFLICT (query_hash) DO UPDATE SET
                              results_json = EXCLUDED.results_json,
                              result_count = EXCLUDED.result_count,
                              query_embedding = EXCLUDED.query_embedding,
-                             expires_at = NOW() + INTERVAL '%s seconds'
+                             expires_at = NOW() + make_interval(secs => %s)
                         """,
                         (key, query[:500], categories, language, pageno,
-                         result_count, results_json, vec_str, _CACHE_TTL, _CACHE_TTL)
+                         result_count, results_json, vec_str, ttl, ttl)
                     )
                 else:
                     conn.execute(
@@ -347,18 +382,18 @@ class SXNGPlugin(Plugin):
                            (query_hash, query, categories, language, pageno,
                             result_count, results_json, expires_at)
                            VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb,
-                                   NOW() + INTERVAL '%s seconds')
+                                   NOW() + make_interval(secs => %s))
                            ON CONFLICT (query_hash) DO UPDATE SET
                              results_json = EXCLUDED.results_json,
                              result_count = EXCLUDED.result_count,
-                             expires_at = NOW() + INTERVAL '%s seconds'
+                             expires_at = NOW() + make_interval(secs => %s)
                         """,
                         (key, query[:500], categories, language, pageno,
-                         result_count, results_json, _CACHE_TTL, _CACHE_TTL)
+                         result_count, results_json, ttl, ttl)
                     )
 
-            log.debug("PG cache STORE: %s (%d results, embedding=%s)",
-                      query[:50], result_count, embedding is not None)
+            log.debug("PG cache STORE: %s (%d results, ttl=%ds, embedding=%s)",
+                      query[:50], result_count, ttl, embedding is not None)
 
         except Exception as e:
             log.warning("PG cache write error: %s", e)
