@@ -154,9 +154,9 @@ def _embed_query(query: str) -> list[float] | None:
         return None
 
 
-def _cache_key(query: str, categories: str, language: str, pageno: int) -> str:
+def _cache_key(query: str, categories: str, language: str, pageno: int, safesearch: int = 0) -> str:
     """Generate a deterministic cache key from search parameters."""
-    raw = f"{query.strip().lower()}|{categories}|{language}|{pageno}"
+    raw = f"{query.strip().lower()}|{categories}|{language}|{pageno}|{safesearch}"
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
 
@@ -225,8 +225,9 @@ class SXNGPlugin(Plugin):
         categories = ",".join(sorted(search.search_query.categories))
         language = search.search_query.lang
         pageno = search.search_query.pageno
+        safesearch = search.search_query.safesearch
 
-        key = _cache_key(query, categories, language, pageno)
+        key = _cache_key(query, categories, language, pageno, safesearch)
 
         try:
             with pool.connection() as conn:
@@ -295,8 +296,9 @@ class SXNGPlugin(Plugin):
         categories = ",".join(sorted(search.search_query.categories))
         language = search.search_query.lang
         pageno = search.search_query.pageno
+        safesearch = search.search_query.safesearch
 
-        key = _cache_key(query, categories, language, pageno)
+        key = _cache_key(query, categories, language, pageno, safesearch)
 
         try:
             ordered = search.result_container.get_ordered_results()
