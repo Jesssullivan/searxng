@@ -164,7 +164,7 @@ class SXNGPlugin(Plugin):
     """PostgreSQL result cache with pgvector semantic deduplication."""
 
     id = "pg_cache"
-    active = False  # Opt-in via settings.yml enabled_plugins
+    active = True  # Active by default; gracefully no-ops without SEARXNG_PG_CACHE_URL
 
     def __init__(self, plg_cfg: "PluginCfg") -> None:
         super().__init__(plg_cfg)
