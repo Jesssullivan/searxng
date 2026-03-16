@@ -72,6 +72,27 @@
     {% if not results and not answers %}
         {% include 'simple/messages/no_results.html' %}
     {% endif %}
+
+    {# SSE Progressive Delivery: slow engine results stream in via HTMX #}
+    {% if sse_session_id %}
+    <script src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js"></script>
+    <script src="https://unpkg.com/htmx-ext-sse@2.2.2/sse.js"></script>
+    <div id="sse-results"
+         hx-ext="sse"
+         sse-connect="/search/stream?session={{ sse_session_id }}"
+         sse-swap="new-result"
+         hx-swap="beforeend">
+    </div>
+    <div id="sse-status" sse-swap="progress" hx-swap="innerHTML">
+      <small class="sse-loading">Loading more results from slow engines...</small>
+    </div>
+    <script>
+      document.body.addEventListener('sse:complete', function() {
+        var status = document.getElementById('sse-status');
+        if (status) status.style.display = 'none';
+      });
+    </script>
+    {% endif %}
     </div>
     <div id="backToTop">
       <a href="#" aria-label="{{ _('Back to top') }}">{{ icon_small('navigate-up') }}</a>
