@@ -36,6 +36,7 @@ from flask import (
     make_response,
     redirect,
     send_from_directory,
+    stream_with_context,
 )
 from flask.wrappers import Response
 from flask.json import jsonify
@@ -648,12 +649,25 @@ def search():
     search_query = None
     raw_text_query = None
     result_container = None
+    sse_session_id = None
     try:
         search_query, raw_text_query, _, _, selected_locale = get_search_query_from_webapp(
             sxng_request.preferences, sxng_request.form
         )
         search_obj = searx.search.SearchWithPlugins(search_query, sxng_request, sxng_request.user_plugins)
-        result_container = search_obj.search()
+
+        # Two-phase search for HTML: fast engines first, slow engines via SSE
+        if output_format == 'html' and hasattr(search_obj, 'search_two_phase'):
+            try:
+                _, sse_session_id = search_obj.search_two_phase()
+                search_obj.result_container.close()
+                result_container = search_obj.result_container
+            except Exception:
+                # Fallback to standard search if two-phase fails
+                logger.debug("two-phase search failed, falling back to standard")
+                result_container = search_obj.search()
+        else:
+            result_container = search_obj.search()
 
     except SearxParameterException as e:
         logger.exception('search error: SearxParameterException')
@@ -780,9 +794,44 @@ def search():
         ),
         timeout_limit = sxng_request.form.get('timeout_limit', None),
         timings = engine_timings_pairs,
-        max_response_time = max_response_time
+        max_response_time = max_response_time,
+        sse_session_id = sse_session_id,
         # fmt: on
     )
+
+
+@app.route('/search/stream', methods=['GET'])
+def search_stream():
+    """SSE endpoint for progressive result delivery.
+
+    Returns Server-Sent Events as slow engines complete their searches.
+    Used by HTMX sse-connect on the client to append results incrementally.
+    """
+    from searx import stream as sse_stream
+
+    session_id = sxng_request.args.get('session')
+    if not session_id:
+        return Response("event: error\ndata: missing session parameter\n\n",
+                        mimetype='text/event-stream', status=400)
+
+    session = sse_stream.get_session(session_id)
+    if session is None:
+        return Response("event: error\ndata: session not found\n\n",
+                        mimetype='text/event-stream', status=404)
+
+    def generate():
+        yield from sse_stream.stream_results(session_id)
+
+    response = Response(
+        stream_with_context(generate()),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no',  # Disable nginx buffering
+            'Connection': 'keep-alive',
+        }
+    )
+    return response
 
 
 @app.route('/about', methods=['GET'])

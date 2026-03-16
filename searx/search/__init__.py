@@ -157,6 +157,61 @@ class Search:
                     self.result_container.add_unresponsive_engine(th._engine_name, 'timeout')
                     PROCESSORS[th._engine_name].logger.error('engine timeout')
 
+    def search_two_phase(self, fast_timeout: float = 2.5):
+        """Two-phase search: fast engines first, slow engines in background.
+
+        Returns (fast_results_ready, slow_session_id) where slow_session_id
+        can be used with /search/stream SSE endpoint.
+        """
+        from searx.stream import partition_engines, create_session, mark_engine_done
+
+        requests, self.actual_timeout = self._get_requests()
+        if not requests:
+            return True, None
+
+        fast_requests, slow_requests = partition_engines(requests, PROCESSORS)
+
+        # Phase 1: dispatch fast engines, join with fast_timeout
+        if fast_requests:
+            search_id = str(uuid4())
+            for engine_name, query, request_params in fast_requests:
+                _search = copy_current_request_context(PROCESSORS[engine_name].search)
+                th = threading.Thread(
+                    target=_search,
+                    args=(query, request_params, self.result_container, self.start_time, fast_timeout),
+                    name=search_id,
+                )
+                th._timeout = False
+                th._engine_name = engine_name
+                th.start()
+
+            for th in threading.enumerate():
+                if th.name == search_id:
+                    remaining = max(0.0, fast_timeout - (default_timer() - self.start_time))
+                    th.join(remaining)
+                    if th.is_alive():
+                        th._timeout = True
+                        self.result_container.add_unresponsive_engine(th._engine_name, 'timeout')
+
+        # Phase 2: dispatch slow engines in background (results stream via SSE)
+        session_id = None
+        if slow_requests:
+            session_id = create_session(str(uuid4()), len(slow_requests))
+
+            for engine_name, query, request_params in slow_requests:
+                def _slow_search(en=engine_name, q=query, rp=request_params, sid=session_id):
+                    try:
+                        PROCESSORS[en].search(q, rp, self.result_container, self.start_time, self.actual_timeout)
+                    except Exception as e:
+                        logger.warning("Slow engine %s error: %s", en, e)
+                    finally:
+                        mark_engine_done(sid)
+
+                th = threading.Thread(target=_slow_search, daemon=True)
+                th.start()
+
+        return True, session_id
+
     def search_standard(self):
         """
         Update self.result_container, self.actual_timeout
