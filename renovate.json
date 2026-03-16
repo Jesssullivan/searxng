@@ -1,0 +1,25 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "baseBranches": ["k8s-production-overlay"],
+  "packageRules": [
+    {
+      "matchManagers": ["dockerfile"],
+      "groupName": "docker-base-images",
+      "automerge": false
+    },
+    {
+      "matchManagers": ["pip_requirements"],
+      "groupName": "python-deps",
+      "automerge": false
+    },
+    {
+      "matchManagers": ["github-actions"],
+      "groupName": "github-actions",
+      "automerge": true,
+      "automergeType": "pr"
+    }
+  ],
+  "ignorePaths": ["tests/**"],
+  "labels": ["dependencies", "renovate"]
+}

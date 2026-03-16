@@ -806,7 +806,7 @@ def search_stream():
     """SSE endpoint for progressive result delivery.
 
     Returns Server-Sent Events as slow engines complete their searches.
-    Used by HTMX sse-connect on the client to append results incrementally.
+    Consumed by native EventSource on the client to append results incrementally.
     """
     from searx import stream as sse_stream
 
