@@ -26,6 +26,14 @@ COPY searx/botdetection/valkeydb.py /usr/local/searxng/searx/botdetection/valkey
 # Patch 4: PostgreSQL result cache plugin with pgvector semantic dedup
 COPY searx/plugins/pg_cache.py /usr/local/searxng/searx/plugins/pg_cache.py
 
+# Patch 5: SSE progressive delivery
+COPY searx/stream.py /usr/local/searxng/searx/stream.py
+
+# Patch 6: Templates (homepage, head_extra include, SSE results)
+COPY searx/templates/simple/base.html /usr/local/searxng/searx/templates/simple/base.html
+COPY searx/templates/simple/index.html /usr/local/searxng/searx/templates/simple/index.html
+COPY searx/templates/simple/results.html /usr/local/searxng/searx/templates/simple/results.html
+
 # Install Python dependencies for PG cache + ONNX embeddings
 RUN /usr/local/searxng/.venv/bin/python -m ensurepip 2>/dev/null || true && \
     /usr/local/searxng/.venv/bin/python -m pip install --no-cache-dir \
