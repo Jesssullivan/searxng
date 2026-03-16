@@ -340,12 +340,17 @@ class SXNGPlugin(Plugin):
             results = []
             for r in ordered[:50]:
                 result = {}
-                for k, v in r.items():
+                # Handle both dict-like results and MainResult objects
+                items = r.items() if hasattr(r, 'items') else vars(r).items() if hasattr(r, '__dict__') else []
+                for k, v in items:
+                    if k.startswith('_'):
+                        continue
                     if isinstance(v, (str, int, float, bool, type(None))):
                         result[k] = v
                     elif isinstance(v, list):
                         result[k] = [str(x) for x in v]
-                results.append(result)
+                if result:
+                    results.append(result)
 
             if not results:
                 return
