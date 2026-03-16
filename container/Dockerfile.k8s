@@ -3,12 +3,13 @@
 #   - Configurable rate limit constants (limiter.toml)
 #   - Valkey reconnection logic (sidecar restart resilience)
 #   - Graceful degradation when Valkey is unavailable
-#   - PostgreSQL result cache plugin (psycopg3 + pool)
+#   - PostgreSQL result cache plugin with pgvector semantic dedup
+#   - ONNX all-MiniLM-L6-v2 embedding model (384 dims)
 #
 # Build:
 #   docker build -f container/Dockerfile.k8s \
 #     --build-arg BASE_TAG=2026.3.13-3c1f68c59 \
-#     -t ghcr.io/jesssullivan/searxng:k8s-2026.3.13 .
+#     -t ghcr.io/jesssullivan/searxng:k8s-2026.3.13-semantic .
 
 ARG BASE_TAG=latest
 FROM docker.io/searxng/searxng:${BASE_TAG}
@@ -22,19 +23,24 @@ COPY searx/valkeydb.py /usr/local/searxng/searx/valkeydb.py
 # Patch 3: Graceful degradation in botdetection Valkey client
 COPY searx/botdetection/valkeydb.py /usr/local/searxng/searx/botdetection/valkeydb.py
 
-# Patch 4: PostgreSQL result cache plugin
+# Patch 4: PostgreSQL result cache plugin with pgvector semantic dedup
 COPY searx/plugins/pg_cache.py /usr/local/searxng/searx/plugins/pg_cache.py
 
-# Install psycopg3 + connection pool for PG cache plugin
-# SearXNG uses uv (Rust package manager), not pip
+# Install Python dependencies for PG cache + ONNX embeddings
 RUN /usr/local/searxng/.venv/bin/python -m ensurepip 2>/dev/null || true && \
     /usr/local/searxng/.venv/bin/python -m pip install --no-cache-dir \
     "psycopg[binary]>=3.1" \
-    "psycopg_pool>=3.1" 2>/dev/null || \
-    (wget -qO- https://astral.sh/uv/install.sh | sh 2>/dev/null && \
-     ~/.local/bin/uv pip install --python /usr/local/searxng/.venv/bin/python \
-    "psycopg[binary]>=3.1" \
-    "psycopg_pool>=3.1")
+    "psycopg_pool>=3.1" \
+    "onnxruntime>=1.17" \
+    "tokenizers>=0.15" \
+    "numpy>=1.24"
+
+# Download pre-exported ONNX model (all-MiniLM-L6-v2, 384 dims, ~80MB)
+RUN mkdir -p /usr/local/searxng/models && \
+    wget -q -O /usr/local/searxng/models/all-MiniLM-L6-v2.onnx \
+    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model.onnx" && \
+    wget -q -O /usr/local/searxng/models/tokenizer.json \
+    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json"
 
 # Pre-compile all patched files
 RUN /usr/local/searxng/.venv/bin/python -m compileall \
@@ -43,3 +49,8 @@ RUN /usr/local/searxng/.venv/bin/python -m compileall \
     /usr/local/searxng/searx/botdetection/valkeydb.py \
     /usr/local/searxng/searx/plugins/pg_cache.py \
     2>/dev/null || true
+
+# Environment defaults for ONNX threading safety
+ENV OMP_NUM_THREADS=1
+ENV TOKENIZERS_PARALLELISM=false
+ENV SEARXNG_ONNX_MODEL_DIR=/usr/local/searxng/models
