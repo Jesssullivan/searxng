@@ -11,6 +11,9 @@ on:
       - 'searx/botdetection/valkeydb.py'
       - 'searx/valkeydb.py'
       - 'searx/plugins/pg_cache.py'
+      - 'searx/templates/simple/base.html'
+      - 'searx/templates/simple/results.html'
+      - 'searx/stream.py'
       - 'requirements*.txt'
   workflow_dispatch:
     inputs:
