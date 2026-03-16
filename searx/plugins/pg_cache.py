@@ -1,25 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""PostgreSQL result cache plugin for SearXNG.
+"""PostgreSQL result cache plugin for SearXNG with pgvector semantic dedup.
 
 Caches search results in PostgreSQL for persistent, cross-pod result sharing.
-Phase 1: Exact query hash match. Phase 2: pgvector semantic deduplication.
+Supports exact query hash match AND semantic similarity via pgvector embeddings.
 
-Configure via environment variable:
+Configure via environment variables:
     SEARXNG_PG_CACHE_URL=postgresql://user:pass@host:5432/db
-
-Schema (apply before enabling):
-    CREATE TABLE IF NOT EXISTS searxng_cache (
-        query_hash TEXT PRIMARY KEY,
-        query TEXT NOT NULL,
-        categories TEXT NOT NULL DEFAULT 'general',
-        language TEXT NOT NULL DEFAULT 'en',
-        pageno INTEGER NOT NULL DEFAULT 1,
-        result_count INTEGER NOT NULL DEFAULT 0,
-        results_json TEXT NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '5 minutes'
-    );
-    CREATE INDEX idx_searxng_cache_expires ON searxng_cache (expires_at);
+    SEARXNG_PG_SEMANTIC_THRESHOLD=0.10  (cosine distance, lower = stricter)
+    SEARXNG_PG_CACHE_TTL=300  (seconds)
+    SEARXNG_ONNX_MODEL_DIR=/usr/local/searxng/models  (all-MiniLM-L6-v2 ONNX)
 """
 
 import hashlib
@@ -28,6 +17,7 @@ import logging
 import os
 import time
 import typing
+import numpy as np
 
 from searx.plugins import Plugin, PluginInfo
 
@@ -41,7 +31,17 @@ log = logging.getLogger("searx.plugins.pg_cache")
 # Connection pool (lazy-initialized)
 _POOL = None
 _PG_URL = None
-_CACHE_TTL = 300  # 5 minutes default
+_CACHE_TTL = int(os.environ.get("SEARXNG_PG_CACHE_TTL", "300"))
+_SEMANTIC_THRESHOLD = float(os.environ.get("SEARXNG_PG_SEMANTIC_THRESHOLD", "0.10"))
+
+# ONNX embedding model (lazy-initialized)
+_ONNX_SESSION = None
+_TOKENIZER = None
+_MODEL_DIR = os.environ.get("SEARXNG_ONNX_MODEL_DIR", "/usr/local/searxng/models")
+
+# Prevent threading issues with ONNX + Granian
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
 def _get_pool():
@@ -56,7 +56,7 @@ def _get_pool():
         return None
 
     try:
-        import psycopg_pool  # psycopg 3 pool
+        import psycopg_pool
         _POOL = psycopg_pool.ConnectionPool(
             _PG_URL,
             min_size=1,
@@ -74,6 +74,86 @@ def _get_pool():
         return None
 
 
+def _get_embedder():
+    """Lazy-initialize the ONNX embedding model."""
+    global _ONNX_SESSION, _TOKENIZER
+    if _ONNX_SESSION is not None:
+        return _ONNX_SESSION, _TOKENIZER
+
+    model_path = os.path.join(_MODEL_DIR, "all-MiniLM-L6-v2.onnx")
+    tokenizer_path = os.path.join(_MODEL_DIR, "tokenizer.json")
+
+    if not os.path.exists(model_path) or not os.path.exists(tokenizer_path):
+        log.warning("ONNX model not found at %s, semantic dedup disabled", _MODEL_DIR)
+        return None, None
+
+    try:
+        import onnxruntime as ort
+        from tokenizers import Tokenizer
+
+        _ONNX_SESSION = ort.InferenceSession(
+            model_path,
+            providers=["CPUExecutionProvider"],
+            sess_options=_ort_options(),
+        )
+        _TOKENIZER = Tokenizer.from_file(tokenizer_path)
+        _TOKENIZER.enable_truncation(max_length=128)
+        _TOKENIZER.enable_padding(length=128)
+        log.info("ONNX embedding model loaded: all-MiniLM-L6-v2 (384 dims)")
+        return _ONNX_SESSION, _TOKENIZER
+    except ImportError:
+        log.warning("onnxruntime or tokenizers not installed, semantic dedup disabled")
+        return None, None
+    except Exception as e:
+        log.error("ONNX model load failed: %s", e)
+        return None, None
+
+
+def _ort_options():
+    """ONNX Runtime session options tuned for sidecar use."""
+    import onnxruntime as ort
+    opts = ort.SessionOptions()
+    opts.intra_op_num_threads = 1
+    opts.inter_op_num_threads = 1
+    opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    return opts
+
+
+def _embed_query(query: str) -> list[float] | None:
+    """Generate 384-dim embedding for a search query."""
+    session, tokenizer = _get_embedder()
+    if session is None or tokenizer is None:
+        return None
+
+    try:
+        encoded = tokenizer.encode(query)
+        input_ids = np.array([encoded.ids], dtype=np.int64)
+        attention_mask = np.array([encoded.attention_mask], dtype=np.int64)
+        token_type_ids = np.zeros_like(input_ids, dtype=np.int64)
+
+        outputs = session.run(
+            None,
+            {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "token_type_ids": token_type_ids,
+            },
+        )
+        # Mean pooling over token embeddings
+        token_embeddings = outputs[0]  # (1, seq_len, 384)
+        mask_expanded = attention_mask[:, :, np.newaxis].astype(np.float32)
+        summed = np.sum(token_embeddings * mask_expanded, axis=1)
+        counted = np.sum(mask_expanded, axis=1)
+        mean_pooled = summed / counted
+        # L2 normalize
+        norm = np.linalg.norm(mean_pooled, axis=1, keepdims=True)
+        normalized = (mean_pooled / norm)[0]
+        return normalized.tolist()
+    except Exception as e:
+        log.warning("Embedding generation failed: %s", e)
+        return None
+
+
 def _cache_key(query: str, categories: str, language: str, pageno: int) -> str:
     """Generate a deterministic cache key from search parameters."""
     raw = f"{query.strip().lower()}|{categories}|{language}|{pageno}"
@@ -81,7 +161,7 @@ def _cache_key(query: str, categories: str, language: str, pageno: int) -> str:
 
 
 class SXNGPlugin(Plugin):
-    """PostgreSQL result cache — persistent cross-pod search caching."""
+    """PostgreSQL result cache with pgvector semantic deduplication."""
 
     id = "pg_cache"
     active = False  # Opt-in via settings.yml enabled_plugins
@@ -91,17 +171,16 @@ class SXNGPlugin(Plugin):
         self.info = PluginInfo(
             id=self.id,
             name="PostgreSQL Cache",
-            description="Caches search results in PostgreSQL for persistent cross-pod sharing.",
+            description="Caches search results in PostgreSQL with pgvector semantic deduplication.",
             preference_section="general",
         )
 
     def init(self, app) -> bool:
-        """Initialize PG connection pool."""
+        """Initialize PG connection pool and verify schema."""
         pool = _get_pool()
         if pool is None:
             log.warning("PG cache plugin inactive: no database connection")
             return False
-        # Ensure table exists
         try:
             with pool.connection() as conn:
                 conn.execute("""
@@ -112,7 +191,8 @@ class SXNGPlugin(Plugin):
                         language TEXT NOT NULL DEFAULT 'en',
                         pageno INTEGER NOT NULL DEFAULT 1,
                         result_count INTEGER NOT NULL DEFAULT 0,
-                        results_json TEXT NOT NULL,
+                        results_json JSONB NOT NULL,
+                        query_embedding vector(384),
                         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                         expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '5 minutes'
                     )
@@ -125,13 +205,21 @@ class SXNGPlugin(Plugin):
         except Exception as e:
             log.error("PG cache table creation failed: %s", e)
             return False
+
+        # Pre-warm ONNX model (optional, non-blocking)
+        session, tokenizer = _get_embedder()
+        if session:
+            log.info("Semantic dedup enabled (threshold: cosine distance < %.2f)", _SEMANTIC_THRESHOLD)
+        else:
+            log.info("Semantic dedup disabled (ONNX model not available)")
+
         return True
 
     def pre_search(self, request: "SXNG_Request", search: "SearchWithPlugins") -> bool:
         """Check PG cache before dispatching engines."""
         pool = _get_pool()
         if pool is None:
-            return True  # Continue search normally
+            return True
 
         query = search.search_query.query
         categories = ",".join(sorted(search.search_query.categories))
@@ -142,6 +230,7 @@ class SXNGPlugin(Plugin):
 
         try:
             with pool.connection() as conn:
+                # Phase 1: Exact hash match
                 row = conn.execute(
                     """SELECT results_json, result_count
                        FROM searxng_cache
@@ -149,28 +238,54 @@ class SXNGPlugin(Plugin):
                     (key,)
                 ).fetchone()
 
-            if row:
-                results_json, result_count = row
-                results = json.loads(results_json)
+                if row:
+                    results_json, result_count = row
+                    results = json.loads(results_json) if isinstance(results_json, str) else results_json
+                    for result in results:
+                        search.result_container.add_result(result)
+                    log.debug("PG cache EXACT HIT: %s (%d results)", query[:50], result_count)
+                    search._pg_cache_hit = True
+                    return False
 
-                # Inject cached results into the search result container
-                for result in results:
-                    search.result_container.add_result(result)
+                # Phase 2: Semantic similarity match (if ONNX available)
+                embedding = _embed_query(query)
+                if embedding is not None:
+                    search._pg_query_embedding = embedding
+                    vec_str = "[" + ",".join(str(x) for x in embedding) + "]"
+                    row = conn.execute(
+                        """SELECT results_json, result_count, query,
+                                  query_embedding <-> %s::vector AS distance
+                           FROM searxng_cache
+                           WHERE query_embedding IS NOT NULL
+                             AND expires_at > NOW()
+                             AND query_embedding <-> %s::vector < %s
+                           ORDER BY query_embedding <-> %s::vector
+                           LIMIT 1""",
+                        (vec_str, vec_str, _SEMANTIC_THRESHOLD, vec_str)
+                    ).fetchone()
 
-                log.debug("PG cache HIT: %s (%d results)", query[:50], result_count)
-                search._pg_cache_hit = True
-                return False  # Stop search — results served from cache
+                    if row:
+                        results_json, result_count, cached_query, distance = row
+                        results = json.loads(results_json) if isinstance(results_json, str) else results_json
+                        for result in results:
+                            search.result_container.add_result(result)
+                        log.debug(
+                            "PG cache SEMANTIC HIT: '%s' ~ '%s' (distance=%.4f, %d results)",
+                            query[:30], cached_query[:30], distance, result_count
+                        )
+                        search._pg_cache_hit = True
+                        return False
 
         except Exception as e:
             log.warning("PG cache read error: %s", e)
 
         search._pg_cache_hit = False
-        return True  # Continue search normally
+        return True
 
     def post_search(self, request: "SXNG_Request", search: "SearchWithPlugins") -> None:
         """Store results in PG cache after search completes."""
         if getattr(search, '_pg_cache_hit', False):
-            return  # Don't re-cache a cache hit
+            return
 
         pool = _get_pool()
         if pool is None:
@@ -186,8 +301,7 @@ class SXNGPlugin(Plugin):
         try:
             ordered = search.result_container.get_ordered_results()
             results = []
-            for r in ordered[:50]:  # Cap at 50 results per cache entry
-                # Serialize only JSON-safe fields
+            for r in ordered[:50]:
                 result = {}
                 for k, v in r.items():
                     if isinstance(v, (str, int, float, bool, type(None))):
@@ -202,22 +316,47 @@ class SXNGPlugin(Plugin):
             results_json = json.dumps(results, ensure_ascii=False)
             result_count = len(results)
 
-            with pool.connection() as conn:
-                conn.execute(
-                    """INSERT INTO searxng_cache
-                       (query_hash, query, categories, language, pageno,
-                        result_count, results_json, expires_at)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, NOW() + INTERVAL '%s seconds')
-                       ON CONFLICT (query_hash) DO UPDATE SET
-                         results_json = EXCLUDED.results_json,
-                         result_count = EXCLUDED.result_count,
-                         expires_at = NOW() + INTERVAL '%s seconds'
-                    """,
-                    (key, query[:500], categories, language, pageno,
-                     result_count, results_json, _CACHE_TTL, _CACHE_TTL)
-                )
+            # Get or compute embedding
+            embedding = getattr(search, '_pg_query_embedding', None)
+            if embedding is None:
+                embedding = _embed_query(query)
 
-            log.debug("PG cache STORE: %s (%d results)", query[:50], result_count)
+            with pool.connection() as conn:
+                if embedding is not None:
+                    vec_str = "[" + ",".join(str(x) for x in embedding) + "]"
+                    conn.execute(
+                        """INSERT INTO searxng_cache
+                           (query_hash, query, categories, language, pageno,
+                            result_count, results_json, query_embedding, expires_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s::vector,
+                                   NOW() + INTERVAL '%s seconds')
+                           ON CONFLICT (query_hash) DO UPDATE SET
+                             results_json = EXCLUDED.results_json,
+                             result_count = EXCLUDED.result_count,
+                             query_embedding = EXCLUDED.query_embedding,
+                             expires_at = NOW() + INTERVAL '%s seconds'
+                        """,
+                        (key, query[:500], categories, language, pageno,
+                         result_count, results_json, vec_str, _CACHE_TTL, _CACHE_TTL)
+                    )
+                else:
+                    conn.execute(
+                        """INSERT INTO searxng_cache
+                           (query_hash, query, categories, language, pageno,
+                            result_count, results_json, expires_at)
+                           VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb,
+                                   NOW() + INTERVAL '%s seconds')
+                           ON CONFLICT (query_hash) DO UPDATE SET
+                             results_json = EXCLUDED.results_json,
+                             result_count = EXCLUDED.result_count,
+                             expires_at = NOW() + INTERVAL '%s seconds'
+                        """,
+                        (key, query[:500], categories, language, pageno,
+                         result_count, results_json, _CACHE_TTL, _CACHE_TTL)
+                    )
+
+            log.debug("PG cache STORE: %s (%d results, embedding=%s)",
+                      query[:50], result_count, embedding is not None)
 
         except Exception as e:
             log.warning("PG cache write error: %s", e)
