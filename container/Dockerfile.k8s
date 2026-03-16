@@ -42,6 +42,10 @@ RUN mkdir -p /usr/local/searxng/models && \
     wget -q -O /usr/local/searxng/models/tokenizer.json \
     "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json"
 
+# Register pg_cache plugin in default settings.yml
+RUN sed -i '/searx.plugins.tor_check.SXNGPlugin:/a\\n  searx.plugins.pg_cache.SXNGPlugin:\n    active: true' \
+    /usr/local/searxng/searx/settings.yml
+
 # Pre-compile all patched files
 RUN /usr/local/searxng/.venv/bin/python -m compileall \
     /usr/local/searxng/searx/botdetection/ip_limit.py \
