@@ -196,7 +196,8 @@ class Search:
         # Phase 2: dispatch slow engines in background (results stream via SSE)
         session_id = None
         if slow_requests:
-            session_id = create_session(str(uuid4()), len(slow_requests))
+            slow_engine_names = [en for en, _, _ in slow_requests]
+            session_id = create_session(str(uuid4()), len(slow_requests), slow_engine_names)
 
             for engine_name, query, request_params in slow_requests:
                 def _slow_search(en=engine_name, q=query, rp=request_params, sid=session_id):
@@ -205,7 +206,7 @@ class Search:
                     except Exception as e:
                         logger.warning("Slow engine %s error: %s", en, e)
                     finally:
-                        mark_engine_done(sid)
+                        mark_engine_done(sid, en)
 
                 th = threading.Thread(target=_slow_search, daemon=True)
                 th.start()

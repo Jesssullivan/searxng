@@ -9,8 +9,8 @@ Usage:
   GET /search?q=...              → initial HTML with fast results + SSE div
   GET /search/stream?q=...       → SSE stream of slow engine results
 
-The SSE endpoint returns HTML fragments for each result, compatible
-with HTMX sse-swap for client-side DOM updates.
+The SSE endpoint returns HTML fragments for each result, consumed by
+the native EventSource API on the client for progressive DOM updates.
 """
 
 import json
@@ -34,7 +34,7 @@ _SESSION_TTL = 30  # seconds before cleanup
 FAST_TIMEOUT_THRESHOLD = 2.0
 
 
-def create_session(search_id: str, slow_engine_count: int) -> str:
+def create_session(search_id: str, slow_engine_count: int, slow_engine_names: list[str] | None = None) -> str:
     """Create a session for tracking slow engine results."""
     session_id = str(uuid.uuid4())[:8]
     with _SESSION_LOCK:
@@ -44,6 +44,8 @@ def create_session(search_id: str, slow_engine_count: int) -> str:
             "complete": False,
             "engines_pending": slow_engine_count,
             "engines_done": 0,
+            "engines_completed": [],
+            "engines_all": slow_engine_names or [],
             "created_at": time.monotonic(),
         }
     return session_id
@@ -61,12 +63,14 @@ def add_result(session_id: str, result_html: str, engine_name: str):
             })
 
 
-def mark_engine_done(session_id: str):
+def mark_engine_done(session_id: str, engine_name: str = ""):
     """Mark an engine as completed."""
     with _SESSION_LOCK:
         session = _SESSIONS.get(session_id)
         if session:
             session["engines_done"] += 1
+            if engine_name:
+                session["engines_completed"].append(engine_name)
             if session["engines_done"] >= session["engines_pending"]:
                 session["complete"] = True
 
@@ -90,7 +94,15 @@ def cleanup_sessions():
 
 
 def stream_results(session_id: str):
-    """Generator that yields SSE events as slow engine results arrive."""
+    """Generator that yields SSE events as slow engine results arrive.
+
+    Events emitted:
+      - new-result: HTML fragment ready for DOM insertion (with fade-in class)
+      - progress: JSON with engine completion status for progress bar
+      - complete: JSON summary when all engines finish
+      - timeout: JSON when stream exceeds 15s
+      - error: plain text error message
+    """
     start = time.monotonic()
     last_idx = 0
 
@@ -107,16 +119,33 @@ def stream_results(session_id: str):
             is_complete = session["complete"]
             engines_done = session["engines_done"]
             engines_pending = session["engines_pending"]
+            engines_completed = list(session["engines_completed"])
+            engines_all = list(session["engines_all"])
 
         for result in new_results:
-            yield f"event: new-result\ndata: {json.dumps(result)}\n\n"
+            # Wrap the HTML in a result-enter div for fade-in animation
+            html = result.get("html", "")
+            engine = result.get("engine", "unknown")
+            wrapped = (
+                f'<div class="result-enter" data-engine="{engine}">'
+                f'{html}</div>'
+            )
+            # SSE requires each line of multi-line data to have its own
+            # "data: " prefix. Split on newlines and rejoin with SSE format.
+            data_lines = wrapped.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+            sse_data = "\n".join(f"data: {line}" for line in data_lines)
+            yield f"event: new-result\n{sse_data}\n\n"
 
         # Send progress update
         if engines_pending > 0:
+            last_engine = engines_completed[-1] if engines_completed else ""
             progress = {
                 "done": engines_done,
                 "total": engines_pending,
                 "elapsed": round(time.monotonic() - start, 1),
+                "engine_name": last_engine,
+                "engines_completed": engines_completed,
+                "engines_remaining": [e for e in engines_all if e not in engines_completed],
             }
             yield f"event: progress\ndata: {json.dumps(progress)}\n\n"
 

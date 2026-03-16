@@ -73,24 +73,247 @@
         {% include 'simple/messages/no_results.html' %}
     {% endif %}
 
-    {# SSE Progressive Delivery: slow engine results stream in via HTMX #}
+    {# SSE Progressive Delivery: slow engine results stream in via EventSource #}
     {% if sse_session_id %}
-    <script src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js"></script>
-    <script src="https://unpkg.com/htmx-ext-sse@2.2.2/sse.js"></script>
-    <div id="sse-results"
-         hx-ext="sse"
-         sse-connect="/search/stream?session={{ sse_session_id }}"
-         sse-swap="new-result"
-         hx-swap="beforeend">
+    <style>
+      /* SSE Loading Skeletons */
+      .sse-skeleton-container {
+        padding: 0 1rem;
+      }
+      .result-skeleton {
+        background: linear-gradient(90deg,
+          var(--color-result-background, #fff) 25%,
+          var(--color-result-border, #ddd) 50%,
+          var(--color-result-background, #fff) 75%);
+        background-size: 200% 100%;
+        animation: sse-shimmer 1.5s ease-in-out infinite;
+        border-radius: 0.5rem;
+        margin-bottom: 0.75rem;
+        opacity: 1;
+        transition: opacity 0.4s ease, height 0.4s ease, margin 0.4s ease;
+      }
+      .result-skeleton.sse-fade-out {
+        opacity: 0;
+        height: 0 !important;
+        margin-bottom: 0;
+        overflow: hidden;
+      }
+      .result-skeleton-lg { height: 5rem; }
+      .result-skeleton-md { height: 3.5rem; }
+      .result-skeleton-sm { height: 2.5rem; }
+
+      @keyframes sse-shimmer {
+        0% { background-position: 200% 0; }
+        100% { background-position: -200% 0; }
+      }
+
+      /* SSE Result Fade-In Animation */
+      .result-enter {
+        animation: sse-fadeSlideIn 0.35s ease forwards;
+      }
+      @keyframes sse-fadeSlideIn {
+        from { opacity: 0; transform: translateY(10px); }
+        to { opacity: 1; transform: translateY(0); }
+      }
+
+      /* Engine Progress Indicator */
+      .sse-engine-progress {
+        font-size: 0.85rem;
+        padding: 0.5rem 1rem;
+        margin: 0.75rem 0;
+        border-radius: 0.5rem;
+        background: var(--color-result-background, #fff);
+        border: 1px solid var(--color-result-border, #ddd);
+        color: var(--color-base-font, #444);
+        transition: opacity 0.4s ease;
+      }
+      .sse-engine-progress.sse-done {
+        opacity: 0;
+        pointer-events: none;
+      }
+      .sse-progress-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.5rem;
+        margin-bottom: 0.4rem;
+      }
+      .sse-progress-label {
+        display: flex;
+        align-items: center;
+        gap: 0.4rem;
+        font-weight: 500;
+      }
+      .sse-progress-spinner {
+        display: inline-block;
+        width: 0.85rem;
+        height: 0.85rem;
+        border: 2px solid var(--color-result-border, #ddd);
+        border-top-color: var(--color-btn-background, #3050ff);
+        border-radius: 50%;
+        animation: sse-spin 0.8s linear infinite;
+      }
+      .sse-progress-spinner.sse-done {
+        animation: none;
+        border-color: var(--color-success, #42db34);
+        border-top-color: var(--color-success, #42db34);
+      }
+      @keyframes sse-spin {
+        to { transform: rotate(360deg); }
+      }
+      .sse-progress-count {
+        font-variant-numeric: tabular-nums;
+        opacity: 0.8;
+      }
+      .sse-progress-track {
+        height: 3px;
+        background: var(--color-result-border, #ddd);
+        border-radius: 2px;
+        overflow: hidden;
+        margin-bottom: 0.35rem;
+      }
+      .sse-progress-fill {
+        height: 100%;
+        background: var(--color-btn-background, #3050ff);
+        border-radius: 2px;
+        transition: width 0.4s ease;
+        width: 0%;
+      }
+      .sse-engine-latest {
+        font-size: 0.78rem;
+        opacity: 0.6;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+    </style>
+
+    <div id="sse-engine-progress" class="sse-engine-progress">
+      <div class="sse-progress-header">
+        <span class="sse-progress-label">
+          <span class="sse-progress-spinner" id="sse-spinner"></span>
+          <span id="sse-progress-text">Querying additional engines...</span>
+        </span>
+        <span class="sse-progress-count" id="sse-progress-count">0/?</span>
+      </div>
+      <div class="sse-progress-track">
+        <div class="sse-progress-fill" id="sse-progress-fill"></div>
+      </div>
+      <div class="sse-engine-latest" id="sse-engine-latest"></div>
     </div>
-    <div id="sse-status" sse-swap="progress" hx-swap="innerHTML">
-      <small class="sse-loading">Loading more results from slow engines...</small>
+
+    <div id="sse-results"></div>
+
+    <div id="sse-skeletons" class="sse-skeleton-container">
+      <div class="result-skeleton result-skeleton-lg"></div>
+      <div class="result-skeleton result-skeleton-md"></div>
+      <div class="result-skeleton result-skeleton-sm"></div>
     </div>
+
     <script>
-      document.body.addEventListener('sse:complete', function() {
-        var status = document.getElementById('sse-status');
-        if (status) status.style.display = 'none';
+    (function() {
+      var sessionId = '{{ sse_session_id }}';
+      var resultsEl = document.getElementById('sse-results');
+      var skeletonsEl = document.getElementById('sse-skeletons');
+      var progressEl = document.getElementById('sse-engine-progress');
+      var progressFill = document.getElementById('sse-progress-fill');
+      var progressCount = document.getElementById('sse-progress-count');
+      var progressText = document.getElementById('sse-progress-text');
+      var engineLatest = document.getElementById('sse-engine-latest');
+      var spinner = document.getElementById('sse-spinner');
+      var skeletons = skeletonsEl ? skeletonsEl.querySelectorAll('.result-skeleton') : [];
+      var skeletonIdx = 0;
+
+      function removeSkeleton() {
+        if (skeletonIdx < skeletons.length) {
+          skeletons[skeletonIdx].classList.add('sse-fade-out');
+          skeletonIdx++;
+        }
+      }
+
+      function finishStream(text) {
+        // Remove remaining skeletons
+        for (var i = 0; i < skeletons.length; i++) {
+          skeletons[i].classList.add('sse-fade-out');
+        }
+        // Mark progress as done
+        if (spinner) spinner.classList.add('sse-done');
+        if (progressText) progressText.textContent = text || 'All engines responded';
+        if (progressFill) progressFill.style.width = '100%';
+        if (progressEl) {
+          setTimeout(function() {
+            progressEl.classList.add('sse-done');
+          }, 1500);
+        }
+        // Clean up skeletons after transition
+        if (skeletonsEl) {
+          setTimeout(function() {
+            skeletonsEl.style.display = 'none';
+          }, 500);
+        }
+      }
+
+      var evtSource = new EventSource('/search/stream?session=' + encodeURIComponent(sessionId));
+
+      evtSource.addEventListener('new-result', function(e) {
+        if (resultsEl && e.data) {
+          removeSkeleton();
+          var div = document.createElement('div');
+          div.innerHTML = e.data;
+          resultsEl.appendChild(div.firstChild || div);
+        }
       });
+
+      evtSource.addEventListener('progress', function(e) {
+        try {
+          var data = JSON.parse(e.data);
+          var done = data.done || 0;
+          var total = data.total || 1;
+          var pct = Math.round((done / total) * 100);
+
+          if (progressFill) progressFill.style.width = pct + '%';
+          if (progressCount) progressCount.textContent = done + '/' + total;
+
+          if (data.engine_name && engineLatest) {
+            engineLatest.textContent = data.engine_name + ' responded';
+          }
+
+          if (data.engines_remaining && data.engines_remaining.length > 0 && progressText) {
+            progressText.textContent = 'Waiting for ' + data.engines_remaining.length + ' engine' +
+              (data.engines_remaining.length > 1 ? 's' : '') + '...';
+          }
+        } catch (err) { /* ignore parse errors */ }
+      });
+
+      evtSource.addEventListener('complete', function(e) {
+        evtSource.close();
+        try {
+          var data = JSON.parse(e.data);
+          var elapsed = data.elapsed ? ' (' + data.elapsed + 's)' : '';
+          finishStream('All engines responded' + elapsed);
+        } catch (err) {
+          finishStream('All engines responded');
+        }
+      });
+
+      evtSource.addEventListener('timeout', function(e) {
+        evtSource.close();
+        finishStream('Stream timed out - some engines may not have responded');
+      });
+
+      evtSource.addEventListener('error', function(e) {
+        evtSource.close();
+        finishStream('Connection closed');
+      });
+
+      // Safety: close after 20s regardless
+      setTimeout(function() {
+        if (evtSource.readyState !== EventSource.CLOSED) {
+          evtSource.close();
+          finishStream('Stream ended');
+        }
+      }, 20000);
+    })();
     </script>
     {% endif %}
     </div>
