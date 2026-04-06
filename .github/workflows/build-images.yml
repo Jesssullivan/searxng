@@ -3,7 +3,7 @@ name: Build SearXNG K8s Images
 
 on:
   push:
-    branches: [k8s-production-overlay]
+    branches: [k8s-overlay-v2]
     paths:
       - 'container/Dockerfile.k8s'
       - 'container/entrypoint.sh'
